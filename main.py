@@ -1,0 +1,111 @@
+from modal import Image, App
+import modal
+
+huggingface_secret = modal.Secret.from_name(
+    "huggingface_secret", required_keys=["HF_TOKEN", "WANDB_API_KEY"]
+)
+# Create stub and image
+app = App("diabetesseek")
+GPU_USED = "A100-80GB:3"
+DATASET_ID="lukasnellotus/clinical-all-patients-dataset-with-diabetes-labels-and-prompt"
+MODEL_ID="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+def download_models():
+    # Load model directly
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from datasets import load_dataset
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
+    dataset = load_dataset(DATASET_ID)
+
+
+image = (
+    Image.debian_slim(python_version="3.11")
+    .pip_install("vllm==0.7.2", gpu=GPU_USED)
+    .apt_install("git")
+    .apt_install("wget")
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})  # turn on faster downloads from HF
+    .run_commands("""ls && \
+wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb && \
+dpkg -i cuda-keyring_1.1-1_all.deb && \
+apt-get update && \
+apt-get install -y cuda-toolkit    
+""")
+    .run_commands(
+        'git clone https://github.com/huggingface/open-r1.git && cd open-r1 && pip install -e ".[dev]"', gpu=GPU_USED
+    )
+    .run_commands("ls && pwd")
+    .run_function(download_models, secrets=[huggingface_secret])
+    .pip_install("wandb")
+    .pip_install("peft")
+    #install fromm https://github.com/huggingface/trl/compare/main...LukasNel:trl:patch-2
+    .run_commands("pip uninstall -y trl && pip install git+https://github.com/LukasNel/trl.git@patch-2")
+    .add_local_file("lotus_diabetes_seek.py", "/open-r1/src/open_r1/grpo_lukas.py")
+)
+
+
+
+@app.function(image=image, secrets=[huggingface_secret], gpu="A100-80GB:4", timeout=43200,
+              volumes={
+                  "/data": modal.Volume.from_name("diabetesseek-data")
+              })
+async def run_training():
+    import os
+    import subprocess
+    os.chdir('/open-r1')
+    with open('zero3.yaml', 'w') as f:
+        f.write("""
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  deepspeed_multinode_launcher: standard
+  offload_optimizer_device: none
+  offload_param_device: none
+  zero3_init_flag: false
+  zero_stage: 2
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 4
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+""")
+
+
+    cmd = [
+        'accelerate', 'launch',
+        '--config_file', 'zero3.yaml',
+        'src/open_r1/grpo_lukas.py',
+        '--output_dir', '/data/DeepSeek-R1-Distill-Qwen-7B-GRPO-full',
+        # '--model_name_or_path', 'HuggingFaceTB/SmolLM2-1.7B-Instruct',
+        '--model_name_or_path',MODEL_ID,
+        "--report_to", "wandb",
+        '--dataset_name', DATASET_ID,
+        '--max_prompt_length', '256',
+        '--max_completion_length', '2048',
+        '--per_device_train_batch_size', '1',
+        '--gradient_accumulation_steps', '16',
+        "--save_steps", "10",
+        '--num_generations', '4',
+        "--log_completions", "True",
+        '--logging_steps', '1',
+        '--log_level', 'debug',
+        '--run_name', 'diabetesseek-check',
+        # '--project_name', 'diabetesseek',
+        # "--repo_id", "2084Collective/deepstock-v1",
+        '--num_train_epochs', '1',
+        '--bf16', 'true',
+        # "--use_peft", "true",  
+    ]
+    subprocess.run(cmd, check=True)
+
+
+@app.local_entrypoint()
+async def main():
+    await run_training.remote.aio()
